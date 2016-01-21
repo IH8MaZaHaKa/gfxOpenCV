@@ -84,6 +84,7 @@
 
 #include "precomp.hpp"
 #include "opencl_kernels_video.hpp"
+#include <gfx\gfx_rt.h>
 #include <cilk\cilk.h>
 
 #define INTEL_GFX_OFFLOAD
@@ -358,10 +359,10 @@ protected:
 
 #ifdef INTEL_GFX_OFFLOAD
 
-    Mat gfx_weight;
-    Mat gfx_variance;
-    Mat gfx_mean;
-    Mat gfx_bgmodelUsedModes;
+    UMat gfx_weight;
+    UMat gfx_variance;
+    UMat gfx_mean;
+    UMat gfx_bgmodelUsedModes;
 
 #endif
 
@@ -859,7 +860,7 @@ void BackgroundSubtractorMOG2Impl::create_ocl_apply_kernel()
 
 #endif
 
-struct _declspec(target(gfx)) float4 {
+struct __declspec(target(gfx)) float4 {
     float4(float _x =0, float _y =0, float _z =0, float _w =0) : x(_x), y(_y), z(_z), w(_w) {}
 
     float x;
@@ -868,8 +869,17 @@ struct _declspec(target(gfx)) float4 {
     float w;
 };
 
+__declspec(target(gfx))
+inline float dot(float a, float b) { return (a * b); }
+
+__declspec(target(gfx))
+inline float dot(float4 a, float4 b) { return (a.x * b.x + a.y * b.y + a.z * b.z + a.w + b.w); }
+
+__declspec(target(gfx))
+inline float clamp(float a, float b, float c) { return std::fmin(std::fmax(a, b), c); }
+
 __declspec(target(gfx)) 
-inline void frameToMean(const uchar *a, float *b) { b = *a; };
+inline void frameToMean(const uchar *a, float *b) { *b = *a; };
 
 __declspec(target(gfx))
 inline void frameToMean(const uchar *a, float4 &b) {
@@ -899,6 +909,12 @@ inline float sum(float val) { return val; }
 __declspec(target(gfx))
 inline float sum(const float4 val) { return (val.x + val.y + val.z); }
 
+__declspec(target(gfx))
+inline float mad(float a, float b, float c) { return a * b + c;  }
+
+__declspec(target(gfx))
+inline float mad24(float a, float b, float c) { return a * b + c; }
+
 template <typename T_MEAN>
 __declspec(target(gfx))
 void GFX_mog2_kernel(const uchar* frame, int frame_step, int frame_offset, int frame_row, int frame_col,  //uchar || uchar3
@@ -910,14 +926,13 @@ void GFX_mog2_kernel(const uchar* frame, int frame_step, int frame_offset, int f
                           float alphaT, float alpha1, float prune,
                           float c_Tb, float c_TB, float c_Tg, float c_varMin,                                           //constants
                           float c_varMax, float c_varInit, float c_tau, 
-                          bool ShadowDetect, uchar c_shadowVal, int CN, int NMIXTURES, int x, int y,)
+                          bool ShadowDetect, uchar c_shadowVal, int CN, int NMIXTURES, int x, int y)
 {
-        if( x < frame_col && y < frame_row)
-        {
+    if( x < frame_col && y < frame_row) {
         /*Высчитываем отступ, до начала необработанного фрагмента*/
-         const uchar* _frame = (frame + mad24(y, frame_step, mad24(x, CN, frame_offset)));
+        const uchar* _frame = (frame + (size_t)mad24(y, frame_step, mad24(x, CN, frame_offset)));
         T_MEAN pix;
-        frameToMean(_frame, pix); // pix = *(_frame), если CN = 1
+        frameToMean(_frame, &pix); // pix = *(_frame), если CN = 1
 
         uchar foreground = 255; // 0 - the pixel classified as background
 
@@ -962,7 +977,7 @@ void GFX_mog2_kernel(const uchar* frame, int frame_step, int frame_offset, int f
                 float variance_new  = clamp(mad(k, (dist2 - c_var), c_var), c_varMin, c_varMax);
 
                 for (int i = mode; i > 0; --i)
-                {
+                {   
                     int prev_idx = mode_idx - idx_step;
                     if (c_weight < _weight[prev_idx])
                         break;
@@ -1010,7 +1025,7 @@ void GFX_mog2_kernel(const uchar* frame, int frame_step, int frame_offset, int f
         {
             totalWeight = 1.f / totalWeight;
             for (int mode = 0; mode < nmodes; ++mode)
-                _weight[mad24(mode, idx_step, pt_idx)] *= totalWeight;
+                _weight[(size_t)mad24(mode, idx_step, pt_idx)] *= totalWeight;
         }
 
         if (!fitsPDF)
@@ -1084,7 +1099,7 @@ void GFX_mog2_kernel(const uchar* frame, int frame_step, int frame_offset, int f
             }
         }
     }
-         uchar* _fgmask = fgmask + mad24(y, fgmask_step, x + fgmask_offset);
+         uchar* _fgmask = fgmask + (size_t)mad24(y, fgmask_step, x + fgmask_offset);
         *_fgmask = (uchar)foreground;
     }
 }
@@ -1150,25 +1165,27 @@ void BackgroundSubtractorMOG2Impl::apply(InputArray _image, OutputArray _fgmask,
 
     const double alpha1 = 1.0f - learningRate;
 
-    Mat frame = _image.getMat();
+    UMat gfx_frame = _image.getUMat();
     _fgmask.create(_image.size(), CV_8U);
-    Mat fgmask = _fgmask.getMat();
+    UMat fgmask = _fgmask.getUMat();
 
     float varMax = MAX(fVarMin, fVarMax);
     float varMin = MIN(fVarMin, fVarMax);
 
     if (1 == nchannels) {
-        GFX_mog2_kernel<float>(frame.ptr<uchar>(), /*Может быть неверно*/frame.cols * frame.elemSize(), 
-            frame.offset, frame.rows, frame.cols, gfx_bgmodelUsedModes.ptr<uchar>(), gfx_weight.ptr<uchar>(),
-            gfx_mean.ptr<uchar>(), gfx_variance.ptr<uchar>(), fgmask.ptr<uchar>(), learnRate, alpha1, (-learningRate*fCT),
-                               varThreshold, varMin, varMax, fVarInit, fTau, bShadowDetection, 
-                               nShadowDetection, nchannels, nmixtures, 0, 0);
-    } else 
+        GFX_mog2_kernel<float>((const uchar*)gfx_frame.handle(ACCESS_READ), gfx_frame.step,
+            gfx_frame.offset, gfx_frame.rows, gfx_frame.cols, (uchar*)gfx_bgmodelUsedModes.handle(ACCESS_READ + ACCESS_WRITE),
+                               (uchar*)gfx_weight.handle(ACCESS_READ + ACCESS_WRITE), (uchar*)gfx_mean.handle(ACCESS_READ + ACCESS_WRITE),
+                               (uchar*)gfx_variance.handle(ACCESS_READ + ACCESS_WRITE), (uchar*)fgmask.handle(ACCESS_READ + ACCESS_WRITE), fgmask.step,
+                               fgmask.offset, learnRate, alpha1, (-learningRate*fCT),
+                               varThreshold, backgroundRatio, varThresholdGen, varMin, varMax, fVarInit, 
+                               fTau, bShadowDetection, nShadowDetection, nchannels, nmixtures, 0, 0);
+    } /*else 
         GFX_mog2_kernel<float4>(frame, frame.cols * frame.elemSize(), 
                                frame.offset, frame.rows, frame.cols, gfx_bgmodelUsedModes, gfx_weight, 
                                gfx_mean, gfx_variance, fgmask, learnRate, alpha1, (-learningRate*fCT),
                                varThreshold, varMin, varMax, fVarInit, fTau, bShadowDetection, 
-                               nShadowDetection, nchannels, nmixtures, 0, 0);
+                               nShadowDetection, nchannels, nmixtures, 0, 0);*/
     return;
 
 #else 
