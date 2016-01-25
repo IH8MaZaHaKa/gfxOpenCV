@@ -82,6 +82,7 @@
 //Date: 7-April-2011, Version:1.0
 ///////////*/
 
+
 #include "precomp.hpp"
 #include "opencl_kernels_video.hpp"
 #include <gfx\gfx_rt.h>
@@ -876,7 +877,21 @@ __declspec(target(gfx))
 inline float dot(float4 a, float4 b) { return (a.x * b.x + a.y * b.y + a.z * b.z + a.w + b.w); }
 
 __declspec(target(gfx))
-inline float clamp(float a, float b, float c) { return std::fmin(std::fmax(a, b), c); }
+inline float gfx_min(float a, float b) { 
+    if (a < b)
+        return a;
+    return b;
+}
+
+__declspec(target(gfx))
+inline float gfx_max(float a, float b) {
+    if (a > b)
+        return a;
+    return b;
+}
+
+__declspec(target(gfx))
+inline float clamp(float a, float b, float c) { return gfx_min(gfx_max(a, b), c); }
 
 __declspec(target(gfx)) 
 inline void frameToMean(const uchar *a, float *b) { *b = *a; };
@@ -916,159 +931,159 @@ __declspec(target(gfx))
 inline float mad24(float a, float b, float c) { return a * b + c; }
 
 template <typename T_MEAN>
-__declspec(target(gfx))
-void GFX_mog2_kernel(const uchar* frame, int frame_step, int frame_offset, int frame_row, int frame_col,  //uchar || uchar3
-                           uchar* modesUsed,                                                                    //uchar
-                           uchar* weight,                                                                       //float
-                           uchar* mean,                                                                         //T_MEAN=float || float4
-                           uchar* variance,                                                                     //float
-                           uchar* fgmask, int fgmask_step, int fgmask_offset,                                   //uchar
-                          float alphaT, float alpha1, float prune,
-                          float c_Tb, float c_TB, float c_Tg, float c_varMin,                                           //constants
-                          float c_varMax, float c_varInit, float c_tau, 
-                          bool ShadowDetect, uchar c_shadowVal, int CN, int NMIXTURES, int x, int y)
-{
-    if( x < frame_col && y < frame_row) {
-        /*Высчитываем отступ, до начала необработанного фрагмента*/
-        const uchar* _frame = (frame + (size_t)mad24(y, frame_step, mad24(x, CN, frame_offset)));
-        T_MEAN pix;
-        frameToMean(_frame, &pix); // pix = *(_frame), если CN = 1
+__declspec(target(gfx_kernel))
+void GFX_mog2_kernel(const uchar* _frame, const int idx_step, const T_MEAN pix, uchar &mode_copy,
+uchar nmodes, float &totalWeight, bool &fitsPDF, uchar &foreground,
+bool main_break_flag, float* _weight,
+T_MEAN* _mean, int counter_copy,
+float* _variance,
+uchar* fgmask, int fgmask_step, int fgmask_offset,
+float alphaT, float alpha1, float prune,
+float c_Tb, float c_TB, float c_Tg, float c_varMin,
+float c_varMax, float c_varInit, float c_tau,
+bool ShadowDetect, uchar c_shadowVal, int CN, int NMIXTURES) {
+    _Cilk_for(uchar mode = 0; mode < nmodes; ++mode) {
+        int mode_idx = mad24(mode, idx_step, 0);
+        float c_weight = mad(alpha1, _weight[mode_idx], prune);
 
-        uchar foreground = 255; // 0 - the pixel classified as background
+        float c_var = _variance[mode_idx];
 
-        bool fitsPDF = false; //if it remains zero a new GMM mode will be added
-        /*Получаем номер текущего пикселя*/
-        int pt_idx =  mad24(y, frame_col, x);
-        /*Количество пикселей во фрейме*/
-        int idx_step = frame_row * frame_col;
+        T_MEAN c_mean = _mean[mode_idx];
 
-        uchar* _modesUsed = modesUsed + pt_idx;
-        uchar nmodes = _modesUsed[0];
+        T_MEAN diff = c_mean - pix;
+        float dist2 = dot(diff, diff);
 
-        float totalWeight = 0.0f;
+        if (totalWeight < c_TB && dist2 < c_Tb * c_var)
+            foreground = 0;
 
-        float* _weight = ( float*)(weight);
-        float* _variance = ( float*)(variance);
-        T_MEAN* _mean = ( T_MEAN*)(mean);
+        bool break_flag = false;
+        int c_weight_copy;
+        int totalWeight_copy;
+        uchar weight_copy;
 
-        uchar mode = 0;
-        for (; mode < nmodes; ++mode)
-        {
-            int mode_idx = mad24(mode, idx_step, pt_idx);
-            float c_weight = mad(alpha1, _weight[mode_idx], prune);
+        if (dist2 < c_Tg * c_var) {
+            fitsPDF = true;
+            c_weight += alphaT;
 
-            float c_var = _variance[mode_idx];
+            float k = alphaT / c_weight;
+            T_MEAN mean_new = mad((T_MEAN)-k, diff, c_mean);
+            float variance_new = clamp(mad(k, (dist2 - c_var), c_var), c_varMin, c_varMax);
 
-            T_MEAN c_mean = _mean[mode_idx];
+            uchar temp_weight[3];
+            int mode_idx_copy;
 
-            T_MEAN diff = c_mean - pix;
-            float dist2 = dot(diff, diff);
+            _Cilk_for(int i = mode; i > 0; --i) {
+                int prev_idx = mode_idx - idx_step;
 
-            if (totalWeight < c_TB && dist2 < c_Tb * c_var)
-                foreground = 0;
-
-            if (dist2 < c_Tg * c_var)
-            {
-                fitsPDF = true;
-                c_weight += alphaT;
-
-                float k = alphaT / c_weight;
-                T_MEAN mean_new = mad((T_MEAN)-k, diff, c_mean);
-                float variance_new  = clamp(mad(k, (dist2 - c_var), c_var), c_varMin, c_varMax);
-
-                for (int i = mode; i > 0; --i)
-                {   
-                    int prev_idx = mode_idx - idx_step;
-                    if (c_weight < _weight[prev_idx])
-                        break;
-
-                    _weight[mode_idx]   = _weight[prev_idx];
-                    _variance[mode_idx] = _variance[prev_idx];
-                    _mean[mode_idx]     = _mean[prev_idx];
-
-                    mode_idx = prev_idx;
+                if (c_weight < _weight[prev_idx]) {
+                    i = 0;
+                    break_flag = true;
+                    temp_weight[0] = _weight[mode_idx];
+                    temp_weight[1] = _variance[mode_idx];
+                    temp_weight[2] = _mean[mode_idx];
+                    mode_idx_copy = mode_idx;
                 }
 
-                _mean[mode_idx]     = mean_new;
-                _variance[mode_idx] = variance_new;
-                _weight[mode_idx]   = c_weight; //update weight by the calculated value
-
-                totalWeight += c_weight;
-
-                mode ++;
-
-                break;
-            }
-            if (c_weight < -prune)
-                c_weight = 0.0f;
-
-            _weight[mode_idx] = c_weight; //update weight by the calculated value
-            totalWeight += c_weight;
-        }
-
-        for (; mode < nmodes; ++mode)
-        {
-            int mode_idx = mad24(mode, idx_step, pt_idx);
-            float c_weight = mad(alpha1, _weight[mode_idx], prune);
-
-            if (c_weight < -prune)
-            {
-                c_weight = 0.0f;
-                nmodes = mode;
-                break;
-            }
-            _weight[mode_idx] = c_weight; //update weight by the calculated value
-            totalWeight += c_weight;
-        }
-
-        if (0.f < totalWeight)
-        {
-            totalWeight = 1.f / totalWeight;
-            for (int mode = 0; mode < nmodes; ++mode)
-                _weight[(size_t)mad24(mode, idx_step, pt_idx)] *= totalWeight;
-        }
-
-        if (!fitsPDF)
-        {
-            uchar mode = nmodes == (NMIXTURES) ? (NMIXTURES) - 1 : nmodes++;
-            int mode_idx = mad24(mode, idx_step, pt_idx);
-
-            if (nmodes == 1)
-                _weight[mode_idx] = 1.f;
-            else
-            {
-                _weight[mode_idx] = alphaT;
-
-                for (int i = pt_idx; i < mode_idx; i += idx_step)
-                    _weight[i] *= alpha1;
-            }
-
-            for (int i = nmodes - 1; i > 0; --i)
-            {
-                int prev_idx = mode_idx - idx_step;
-                if (alphaT < _weight[prev_idx])
-                    break;
-
-                _weight[mode_idx]   = _weight[prev_idx];
+                _weight[mode_idx] = _weight[prev_idx];
                 _variance[mode_idx] = _variance[prev_idx];
-                _mean[mode_idx]     = _mean[prev_idx];
+                _mean[mode_idx] = _mean[prev_idx];
 
                 mode_idx = prev_idx;
             }
 
-            _mean[mode_idx] = pix;
-            _variance[mode_idx] = c_varInit;
+            if (break_flag) {
+                mode_idx = mode_idx_copy;
+                _weight[mode_idx] = temp_weight[0];
+                _variance[mode_idx] = temp_weight[1];
+                _mean[mode_idx] = temp_weight[2];
+            }
+
+            _mean[mode_idx] = mean_new;
+            _variance[mode_idx] = variance_new;
+            _weight[mode_idx] = c_weight; //update weight by the calculated value
+
+            totalWeight += c_weight;
+
+            mode++;
+
+            main_break_flag = true;
+            c_weight_copy = c_weight;
+            totalWeight_copy = totalWeight;
+            weight_copy = _weight[mode_idx];
         }
 
-        _modesUsed[0] = nmodes;
+        if (c_weight < -prune)
+            c_weight = 0.0f;
+
+        _weight[mode_idx] = c_weight; //update weight by the calculated value
+        totalWeight += c_weight;
+
+        if (main_break_flag) {
+            c_weight = c_weight_copy;
+            totalWeight = totalWeight_copy;
+            _weight[mode_idx] = weight_copy;
+            counter_copy = mode;
+            mode_copy = mode;
+            mode = nmodes;
+        }
+    }
+}
+
+/*    for (; mode < nmodes; ++mode) {
+        int mode_idx = mad24(mode, idx_step, pt_idx);
+        float c_weight = mad(alpha1, _weight[mode_idx], prune);
+
+        if (c_weight < -prune) {
+            c_weight = 0.0f;
+            nmodes = mode;
+            break;
+        }
+        _weight[mode_idx] = c_weight; //update weight by the calculated value
+        totalWeight += c_weight;
+    }
+
+    if (0.f < totalWeight) {
+        totalWeight = 1.f / totalWeight;
+        _Cilk_for(int mode = 0; mode < nmodes; ++mode)
+            _weight[(size_t)mad24(mode, idx_step, pt_idx)] *= totalWeight;
+    }
+
+    if (!fitsPDF) {
+        uchar mode = nmodes == (NMIXTURES) ? (NMIXTURES)-1 : nmodes++;
+        int mode_idx = mad24(mode, idx_step, pt_idx);
+
+        if (nmodes == 1)
+            _weight[mode_idx] = 1.f;
+        else {
+            _weight[mode_idx] = alphaT;
+
+            _Cilk_for(int i = pt_idx; i < mode_idx; i += idx_step)
+                _weight[i] *= alpha1;
+        }
+
+        for (int i = nmodes - 1; i > 0; --i) {
+            int prev_idx = mode_idx - idx_step;
+            if (alphaT < _weight[prev_idx])
+                break;
+
+            _weight[mode_idx] = _weight[prev_idx];
+            _variance[mode_idx] = _variance[prev_idx];
+            _mean[mode_idx] = _mean[prev_idx];
+
+            mode_idx = prev_idx;
+        }
+
+        _mean[mode_idx] = pix;
+        _variance[mode_idx] = c_varInit;
+    }
+
+    _modesUsed[0] = nmodes;
 
     if (ShadowDetect) {
-        if (foreground)
-        {
+        if (foreground) {
             float tWeight = 0.0f;
 
-            for (uchar mode = 0; mode < nmodes; ++mode)
-            {
+            for (uchar mode = 0; mode < nmodes; ++mode) {
                 int mode_idx = mad24(mode, idx_step, pt_idx);
                 T_MEAN c_mean = _mean[mode_idx];
 
@@ -1080,14 +1095,12 @@ void GFX_mog2_kernel(const uchar* frame, int frame_step, int frame_offset, int f
                 if (denominator == 0)
                     break;
 
-                if (numerator <= denominator && numerator >= c_tau * denominator)
-                {
+                if (numerator <= denominator && numerator >= c_tau * denominator) {
                     float a = numerator / denominator;
 
                     T_MEAN dD = mad(a, c_mean, -pix);
 
-                    if (dot(dD, dD) < c_Tb * _variance[mode_idx] * a * a)
-                    {
+                    if (dot(dD, dD) < c_Tb * _variance[mode_idx] * a * a) {
                         foreground = c_shadowVal;
                         break;
                     }
@@ -1099,10 +1112,9 @@ void GFX_mog2_kernel(const uchar* frame, int frame_step, int frame_offset, int f
             }
         }
     }
-         uchar* _fgmask = fgmask + (size_t)mad24(y, fgmask_step, x + fgmask_offset);
-        *_fgmask = (uchar)foreground;
-    }
-}
+    uchar* _fgmask = fgmask + (size_t)mad24(y, fgmask_step, x + fgmask_offset);
+    *_fgmask = (uchar)foreground;
+}*/
 
 /*void getBackgroundImage2_kernel(const uchar* modesUsed,
                                           const uchar* weight,
@@ -1147,6 +1159,37 @@ void GFX_mog2_kernel(const uchar* frame, int frame_step, int frame_offset, int f
     }
 }*/
 
+void GFX_mog2_wrapper(const uchar* gfx_frame, int idx_step, uchar *gfx_bgmodelUsedModes,
+    uchar* gfx_weight,
+    uchar* gfx_mean,
+    uchar* gfx_variance,
+    uchar* fgmask, int fgmask_step, int fgmask_offset,
+    float alphaT, float alpha1, float prune,
+    float c_Tb, float c_TB, float c_Tg, float c_varMin,
+    float c_varMax, float c_varInit, float c_tau,
+    bool ShadowDetect, uchar c_shadowVal, int nchannels, int nmixtures) {
+    if (1 == nchannels) {
+        uchar foreground = 255;
+        float pix;
+        float totalWeight = 0.0f;
+        bool fitsPDF = false;
+        uchar counter = 0;
+        frameToMean(gfx_frame, &pix);
+        //_GFX_share(gfx_frame, 2);
+        _GFX_offload(GFX_mog2_kernel<float>, gfx_frame, idx_step, pix, counter, *gfx_bgmodelUsedModes, totalWeight, fitsPDF,
+            foreground, false, (float*)gfx_weight, (float*)gfx_mean, 0,
+            (float*)gfx_variance, fgmask, fgmask_step,
+            fgmask_offset, alphaT, alpha1, prune,
+            c_Tb, c_TB, c_Tg, c_varMin, c_varMax, c_varInit,
+            c_tau, ShadowDetect, c_shadowVal, nchannels, nmixtures);
+        //GFX_mog2_kernel<float>();
+        _GFX_wait();
+        if (counter != *gfx_bgmodelUsedModes) {
+
+        }
+    }
+}
+
 void BackgroundSubtractorMOG2Impl::apply(InputArray _image, OutputArray _fgmask, double learningRate)
 {
     bool needToInitialize = nframes == 0 || learningRate >= 1 || _image.size() != frameSize || _image.type() != frameType;
@@ -1172,20 +1215,14 @@ void BackgroundSubtractorMOG2Impl::apply(InputArray _image, OutputArray _fgmask,
     float varMax = MAX(fVarMin, fVarMax);
     float varMin = MIN(fVarMin, fVarMax);
 
-    if (1 == nchannels) {
-        GFX_mog2_kernel<float>((const uchar*)gfx_frame.handle(ACCESS_READ), gfx_frame.step,
-            gfx_frame.offset, gfx_frame.rows, gfx_frame.cols, (uchar*)gfx_bgmodelUsedModes.handle(ACCESS_READ + ACCESS_WRITE),
-                               (uchar*)gfx_weight.handle(ACCESS_READ + ACCESS_WRITE), (uchar*)gfx_mean.handle(ACCESS_READ + ACCESS_WRITE),
-                               (uchar*)gfx_variance.handle(ACCESS_READ + ACCESS_WRITE), (uchar*)fgmask.handle(ACCESS_READ + ACCESS_WRITE), fgmask.step,
-                               fgmask.offset, learnRate, alpha1, (-learningRate*fCT),
-                               varThreshold, backgroundRatio, varThresholdGen, varMin, varMax, fVarInit, 
-                               fTau, bShadowDetection, nShadowDetection, nchannels, nmixtures, 0, 0);
-    } /*else 
-        GFX_mog2_kernel<float4>(frame, frame.cols * frame.elemSize(), 
-                               frame.offset, frame.rows, frame.cols, gfx_bgmodelUsedModes, gfx_weight, 
-                               gfx_mean, gfx_variance, fgmask, learnRate, alpha1, (-learningRate*fCT),
-                               varThreshold, varMin, varMax, fVarInit, fTau, bShadowDetection, 
-                               nShadowDetection, nchannels, nmixtures, 0, 0);*/
+    GFX_mog2_wrapper((const uchar*)gfx_frame.handle(ACCESS_READ) + gfx_frame.offset,
+        gfx_frame.cols * gfx_frame.rows, (uchar*)gfx_bgmodelUsedModes.handle(ACCESS_READ + ACCESS_WRITE),
+        (uchar*)gfx_weight.handle(ACCESS_READ + ACCESS_WRITE), (uchar*)gfx_mean.handle(ACCESS_READ + ACCESS_WRITE),
+        (uchar*)gfx_variance.handle(ACCESS_READ + ACCESS_WRITE), (uchar*)fgmask.handle(ACCESS_READ + ACCESS_WRITE), fgmask.step,
+        fgmask.offset, learnRate, alpha1, (-learningRate*fCT),
+        varThreshold, backgroundRatio, varThresholdGen, varMin, varMax, fVarInit,
+        fTau, bShadowDetection, nShadowDetection, nchannels, nmixtures);
+
     return;
 
 #else 
