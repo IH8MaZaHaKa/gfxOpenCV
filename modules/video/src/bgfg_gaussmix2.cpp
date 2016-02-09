@@ -183,6 +183,7 @@ public:
     ~BackgroundSubtractorMOG2Impl() {}
     //! the update operator
     void apply(InputArray image, OutputArray fgmask, double learningRate=-1);
+    void apply2(InputArray image, OutputArray fgmask, double learningRate=-1);
 
     //! computes a background image which are the mean of all background gaussians
     virtual void getBackgroundImage(OutputArray backgroundImage) const;
@@ -212,7 +213,7 @@ public:
 
         gfx_bgmodelUsedModes.create(frameSize, CV_8UC1);
         gfx_bgmodelUsedModes.setTo(cv::Scalar::all(0));
-        return;
+        //return;
 #endif
 
 #ifdef HAVE_OPENCL
@@ -907,7 +908,7 @@ inline void frameToMean(const uchar *a, float4 &b) {
 }
 
 __declspec(target(gfx))
-uchar gfx_cast(unsigned data) { return (uchar)gfx_min(data, (unsigned)UCHAR_MAX); }
+inline uchar gfx_cast(unsigned data) { return (uchar)gfx_min(data, (unsigned)UCHAR_MAX); }
 
 template <typename T>
 __declspec(target(gfx))
@@ -938,9 +939,10 @@ inline float mad24(float a, float b, float c) { return a * b + c; }
 
 template <typename T_MEAN>
 __declspec(target(gfx_kernel))
-void GFX_mog2_kernel(uchar *data, int count, const uchar* frame, int frame_step, int frame_offset, int frame_row, int frame_col,
-                     uchar* modesUsed,uchar* weight,uchar* mean, uchar* variance, uchar* fgmask, int fgmask_step, int fgmask_offset,
-                     float alphaT, const double alpha1, double prune, double c_Tb, float c_TB, float c_Tg, float c_varMin,
+void GFX_mog2_kernel(const uchar* restrict frame, int frame_step, int frame_offset, int frame_row, int frame_col,
+                     uchar* restrict modesUsed, uchar* restrict weight, uchar* restrict mean, uchar* restrict variance, 
+                     uchar* restrict fgmask, int fgmask_step, int fgmask_offset,
+                     float alphaT, const float alpha1, float prune, float c_Tb, float c_TB, float c_Tg, float c_varMin,
                      float c_varMax, float c_varInit, float c_tau, bool ShadowDetect, uchar c_shadowVal, 
                      int nchannels, int nmixtures) {
 
@@ -989,7 +991,7 @@ void GFX_mog2_kernel(uchar *data, int count, const uchar* frame, int frame_step,
                     T_MEAN mean_new = mad((T_MEAN)-k, diff, c_mean);
                     float variance_new = clamp(mad(k, (dist2 - c_var), c_var), c_varMin, c_varMax);
 
-                    for (int i = mode; i > 0; --i) {
+                    /*for (int i = mode; i > 0; --i) {
                         int prev_idx = mode_idx - idx_step;
                         if (c_weight < _weight[prev_idx])
                             break;
@@ -999,8 +1001,29 @@ void GFX_mog2_kernel(uchar *data, int count, const uchar* frame, int frame_step,
                         _mean[mode_idx] = _mean[prev_idx];
 
                         mode_idx = prev_idx;
+                    }*/
+                    int index_data[mode + 1];
+                    int temp = mode_idx;
+                    int i;
+
+                    index_data[0] = mode_idx;
+                    #pragma simd
+                    _Cilk_for (i = 1; i < mode; i++)
+                        for (int j = 0; j < i; j++)
+                            index_data[i] -= temp;
+
+                    for (i = 1; i < mode; i++)
+                        if (c_weight < _weight[index_data[i]])
+                            break;
+
+                    #pragma simd
+                    _Cilk_for (int j = 0; j < i; j++) {
+                        _weight[index_data[j]] = _weight[index_data[j + 1]];
+                        _variance[index_data[j]] = _variance[index_data[j + 1]];
+                        _mean[index_data[j]] = _mean[index_data[j + 1]];
                     }
 
+                    mode_idx = index_data[i];
                     _mean[mode_idx] = mean_new;
                     _variance[mode_idx] = variance_new;
                     _weight[mode_idx] = c_weight; //update weight by the calculated value
@@ -1033,8 +1056,12 @@ void GFX_mog2_kernel(uchar *data, int count, const uchar* frame, int frame_step,
 
             if (0.f < totalWeight) {
                 totalWeight = 1.f / totalWeight;
-                for (int mode = 0; mode < nmodes; ++mode)
-                    _weight[(int)mad24(mode, idx_step, pt_idx)] *= totalWeight;
+                #pragma simd
+                _Cilk_for (int mode = 0; mode < nmodes; ++mode)
+                    _weight[mode * idx_step + pt_idx] *= totalWeight;
+                // Убрал cilk_for т.к скорость падала
+                // idx_step - размер изображения (не будет ноль, никогда)
+                // pt_idx - текущий пиксель 
             }
 
             if (!fitsPDF) {
@@ -1046,7 +1073,8 @@ void GFX_mog2_kernel(uchar *data, int count, const uchar* frame, int frame_step,
                 else {
                     _weight[mode_idx] = alphaT;
 
-                    for (int i = pt_idx; i < mode_idx; i += idx_step)
+                    #pragma simd
+                    _Cilk_for (int i = pt_idx; i < mode_idx; i += idx_step)
                         _weight[i] *= alpha1;
                 }
 
@@ -1103,7 +1131,6 @@ void GFX_mog2_kernel(uchar *data, int count, const uchar* frame, int frame_step,
             }
             uchar* _fgmask = fgmask + (int)mad24(y, fgmask_step, x + fgmask_offset);
             *_fgmask = (uchar)foreground;
-            data[x + y] = (uchar)foreground;
          }
     }
 }
@@ -1114,8 +1141,8 @@ void GFX_getBackgroundImage2_kernel(const uchar* modesUsed, const uchar* weight,
                                     uchar* dst, int dst_step, int dst_offset, int dst_row, int dst_col,
                                     float c_TB, int nchannels)
 {
-    _Cilk_for (int i = 0; i < dst_col; i++) {
-        _Cilk_for (int j = 0; j < dst_row; j++) {
+    _Cilk_for (int x = 0; x < dst_col; x++) {
+        _Cilk_for (int y = 0; y < dst_row; y++) {
             int pt_idx =  mad24(y, dst_col, x);
 
             const uchar* _modesUsed = modesUsed + pt_idx;
@@ -1129,7 +1156,7 @@ void GFX_getBackgroundImage2_kernel(const uchar* modesUsed, const uchar* weight,
             int idx_step = dst_row * dst_col;
             for (uchar mode = 0; mode < nmodes; ++mode)
             {
-                int mode_idx = mad24(mode, idx_step, pt_idx);
+                int mode_idx = (int)mad24(mode, idx_step, pt_idx);
                 float c_weight = _weight[mode_idx];
                 T_MEAN c_mean = _mean[mode_idx];    
 
@@ -1143,9 +1170,11 @@ void GFX_getBackgroundImage2_kernel(const uchar* modesUsed, const uchar* weight,
 
             if (0.f < totalWeight)
                 meanVal = meanVal / totalWeight;
-            else
+            else {
+
+            }
                 meanVal = (T_MEAN)(0.f);
-             uchar* _dst = dst + mad24(y, dst_step, mad24(x, nchannels, dst_offset));
+            uchar* _dst = dst + (int)mad24(y, dst_step, mad24(x, nchannels, dst_offset));
             meanToFrame(meanVal, _dst);
         }
     }
@@ -1163,7 +1192,7 @@ void BackgroundSubtractorMOG2Impl::apply(InputArray _image, OutputArray _fgmask,
 
     ++nframes;
     float learnRate = learningRate >= 0 && nframes > 1 ? learningRate : 1./std::min( 2*nframes, history );
-    CV_Assert(learnRate >= 0);
+    CV_Assert(learnRate >= 0); 
 
     const double alpha1 = 1.0f - learningRate;
 
@@ -1174,35 +1203,28 @@ void BackgroundSubtractorMOG2Impl::apply(InputArray _image, OutputArray _fgmask,
     float varMax = MAX(fVarMin, fVarMax);
     float varMin = MIN(fVarMin, fVarMax);
 
-    // UMat.step ?! !!!!
     _GFX_share((void*)gfx_frame.ptr<const uchar>(), gfx_frame.u->size);
     _GFX_share((void*)gfx_bgmodelUsedModes.ptr<uchar>(), gfx_bgmodelUsedModes.u->size);
     _GFX_share((void*)gfx_weight.ptr<uchar>(), gfx_weight.u->size);
     _GFX_share((void*)gfx_mean.ptr<uchar>(), gfx_mean.u->size);
     _GFX_share((void*)gfx_variance.ptr<uchar>(), gfx_variance.u->size);
-    uchar *data = new uchar[gfx_frame.u->size];
-    _GFX_share((void*)data, gfx_frame.u->size);
+    _GFX_share((void*)fgmask.ptr<uchar>(), fgmask.u->size);
 
-    _GFX_offload(GFX_mog2_kernel<float>, data, 0, gfx_frame.ptr<const uchar>(), (int)gfx_frame.step.buf[0], 0, gfx_frame.rows, gfx_frame.cols, gfx_bgmodelUsedModes.ptr<uchar>(),
+    _GFX_offload(GFX_mog2_kernel<float>, gfx_frame.ptr<const uchar>(), (int)gfx_frame.step.buf[0], 0, gfx_frame.rows, gfx_frame.cols, gfx_bgmodelUsedModes.ptr<uchar>(),
         gfx_weight.ptr<uchar>(), gfx_mean.ptr<uchar>(), gfx_variance.ptr<uchar>(), fgmask.ptr<uchar>(), (int)fgmask.step.buf[0],
-        0, learnRate, alpha1, (-learningRate*fCT), varThreshold, backgroundRatio,
+        0, learnRate, (float)alpha1, float(-learningRate*fCT), (float)varThreshold, backgroundRatio,
         varThresholdGen, varMin, varMax, fVarInit, fTau, bShadowDetection, nShadowDetection,
         nchannels, nmixtures);
-
+    
     // версия для изображения с 4 каналами
-    //delete []data;
-    _GFX_wait();
-    std::ofstream Test("Test2.txt");
 
-    for (int i = 0; i < gfx_frame.u->size; i++) {
-        Test << data[i];
-    }
+    _GFX_wait();
     _GFX_unshare((void*)gfx_frame.ptr<const uchar>());
     _GFX_unshare((void*)gfx_bgmodelUsedModes.ptr<uchar>());
     _GFX_unshare((void*)gfx_weight.ptr<uchar>());
     _GFX_unshare((void*)gfx_mean.ptr<uchar>());
     _GFX_unshare((void*)gfx_variance.ptr<uchar>());
-    _GFX_unshare(data);
+    _GFX_unshare((void*)fgmask.ptr<uchar>());
     return;
 
 #else   
@@ -1238,6 +1260,32 @@ void BackgroundSubtractorMOG2Impl::apply(InputArray _image, OutputArray _fgmask,
 #endif
 }
 
+void BackgroundSubtractorMOG2Impl::apply2(InputArray _image, OutputArray _fgmask, double learningRate) {
+    bool needToInitialize = nframes == 0 || learningRate >= 1 || _image.size() != frameSize || _image.type() != frameType;
+
+    if( needToInitialize )
+        initialize(_image.size(), _image.type());
+
+    Mat image = _image.getMat();
+    _fgmask.create(image.size(), CV_8U);
+    Mat fgmask = _fgmask.getMat();
+
+    ++nframes;
+    learningRate = learningRate >= 0 && nframes > 1 ? learningRate : 1./std::min( 2*nframes, history );
+    CV_Assert(learningRate >= 0);
+
+    parallel_for_(Range(0, image.rows),
+                  MOG2Invoker(image, fgmask,
+                              bgmodel.ptr<GMM>(),
+                              (float*)(bgmodel.ptr() + sizeof(GMM)*nmixtures*image.rows*image.cols),
+                              bgmodelUsedModes.ptr(), nmixtures, (float)learningRate,
+                              (float)varThreshold,
+                              backgroundRatio, varThresholdGen,
+                              fVarInit, fVarMin, fVarMax, float(-learningRate*fCT), fTau,
+                              bShadowDetection, nShadowDetection),
+                              image.total()/(double)(1 << 16));
+}
+
 void BackgroundSubtractorMOG2Impl::getBackgroundImage(OutputArray backgroundImage) const
 {
     int nchannels = CV_MAT_CN(frameType);
@@ -1247,14 +1295,27 @@ void BackgroundSubtractorMOG2Impl::getBackgroundImage(OutputArray backgroundImag
     backgroundImage.create(frameSize, frameType);
     Mat gfx_backgroundImage = backgroundImage.getMat();
 
+    _GFX_share((void*)gfx_backgroundImage.ptr<uchar>(), gfx_backgroundImage.u->size);
+    _GFX_share((void*)gfx_bgmodelUsedModes.ptr<const uchar>(), gfx_bgmodelUsedModes.u->size);
+    _GFX_share((void*)gfx_weight.ptr<const uchar>(), gfx_weight.u->size);
+    _GFX_share((void*)gfx_mean.ptr<const uchar>(), gfx_mean.u->size);
+    _GFX_share((void*)gfx_variance.ptr<const uchar>(), gfx_variance.u->size);
+
     if (1 == nchannels)
         _GFX_offload(GFX_getBackgroundImage2_kernel<float>, gfx_bgmodelUsedModes.ptr<uchar>(), gfx_weight.ptr<uchar>(), 
-                     u_mean.ptr<uchar>(), gfx_backgroundImage.ptr<uchar>(), gfx_backgroundImage.step.buf[0], 0, 
+                     gfx_mean.ptr<uchar>(), gfx_backgroundImage.ptr<uchar>(), gfx_backgroundImage.step.buf[0], 0, 
                      gfx_backgroundImage.rows, gfx_backgroundImage.cols, backgroundRatio, nchannels);
     else // ???!!! Сколько еще может быть каналов для этого алгоритма?
         _GFX_offload(GFX_getBackgroundImage2_kernel<float>, gfx_bgmodelUsedModes.ptr<uchar>(), gfx_weight.ptr<uchar>(), 
-                     u_mean.ptr<uchar>(), gfx_backgroundImage.ptr<uchar>(), gfx_backgroundImage.step.buf[0], 0, 
+                     gfx_mean.ptr<uchar>(), gfx_backgroundImage.ptr<uchar>(), gfx_backgroundImage.step.buf[0], 0, 
                      gfx_backgroundImage.rows, gfx_backgroundImage.cols, backgroundRatio, nchannels);
+    _GFX_wait();
+    _GFX_unshare((void*)gfx_backgroundImage.ptr<uchar>());
+    _GFX_unshare((void*)gfx_bgmodelUsedModes.ptr<uchar>());
+    _GFX_unshare((void*)gfx_weight.ptr<uchar>());
+    _GFX_unshare((void*)gfx_mean.ptr<uchar>());
+    _GFX_unshare((void*)gfx_variance.ptr<uchar>());
+
     return;
 #endif
 
