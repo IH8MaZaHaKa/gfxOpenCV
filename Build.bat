@@ -7,7 +7,7 @@ cd Build
 mkdir IPP_Host
 cd IPP_Host
 echo CMake Build "IPP + Host (CPU)"
-cmake -DWITH_IPP=ON -DCMAKE_GENERATOR_TOOLSET="Intel C++ Compiler 16.0" ../..
+cmake -DWITH_IPP=ON -DWITH_OPENCL=OFF -DCMAKE_GENERATOR_TOOLSET="Intel C++ Compiler 16.0" ../..
 goto compilation
 :"build1" 
 cd ..
@@ -16,7 +16,7 @@ mkdir OpenCL_CPU
 cd OpenCL_CPU	
 echo CMake Build "OpenCL + Host (CPU)"
 set currentbuild="build2"
-cmake -DWITH_OPENCL=ON -DCMAKE_GENERATOR_TOOLSET="Intel C++ Compiler 16.0" ../..
+cmake -DWITH_OPENCL=ON  -DCMAKE_GENERATOR_TOOLSET="Intel C++ Compiler 16.0" ../..
 goto compilation
 :"build2"
 cd ..
@@ -25,7 +25,7 @@ mkdir OpenCL_GPU
 cd OpenCL_GPU
 echo CMake Build "OpenCL + Host (GPU)"
 set currentbuild="build3" 
-cmake -DWITH_OPENCL=ON -DCMAKE_GENERATOR_TOOLSET="Intel C++ Compiler 16.0" ../..
+cmake -DWITH_OPENCL=ON -DWITH_IPP=OFF -DCMAKE_GENERATOR_TOOLSET="Intel C++ Compiler 16.0" ../..
 goto compilation
 :"build3"
 cd ..
@@ -34,7 +34,7 @@ mkdir GFX_Host
 cd GFX_Host
 echo CMake Build "Intel GFX Offload (GPU)" 
 set currentbuild="build4"
-cmake -DCMAKE_GENERATOR_TOOLSET="Intel C++ Compiler 16.0" ../..
+cmake -DWITH_OPENCL=OFF -DWITH_IPP=OFF -DCMAKE_GENERATOR_TOOLSET="Intel C++ Compiler 16.0" ../..
 goto compilation
 :"build4"
 cd ..
